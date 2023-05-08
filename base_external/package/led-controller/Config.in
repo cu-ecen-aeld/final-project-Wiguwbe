@@ -1,0 +1,5 @@
+
+config BR2_PACKAGE_LED_CONTROLLER
+	bool "led-controller"
+	help
+	  The LED controller for AESD final project
