@@ -7,8 +7,9 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/kobject.h>
-//#include <linux/container_of.h>
 #include <linux/rwsem.h>
+#include <linux/gpio/consumer.h>
+#include <linux/gpio.h>
 
 MODULE_AUTHOR("Tiago Teixeira");
 MODULE_LICENSE("Dual BSD/GPL");
@@ -16,6 +17,12 @@ MODULE_LICENSE("Dual BSD/GPL");
 /*
 	Module Params/Kobjects
 */
+
+/* if debugging */
+//#define LED_INITIAL_STATE 1
+/* for production */
+#define LED_INITIAL_STATE 0
+
 
 static int parent_kobj_init(void);
 
@@ -25,6 +32,7 @@ static int parent_kobj_init(void);
 struct led {
 	struct kobject kobj;
 	s16 pin_number;
+	struct gpio_desc *gpio;
 	struct rw_semaphore pin_number_sem;
 };
 
@@ -32,6 +40,8 @@ static void led_kobj_release(struct kobject *kobj)
 {
 	struct led *led = container_of(kobj, struct led, kobj);
 	printk(KERN_DEBUG "ledcontroller: releasing led kobj %hd\n", led->pin_number);
+	if(led->gpio)
+		gpio_free(led->pin_number);
 	kfree(led);
 }
 
@@ -62,14 +72,64 @@ static ssize_t store_attr(struct kobject *kobj, struct attribute *attr, const ch
 {
 	s16 pin_number;
 	ssize_t ret;
+	struct gpio_desc *prev;
 	struct led *led = container_of(kobj, struct led, kobj);
 	/* TODO ensure attr->name == "pin" (only 1 attribute, so far) */
 	/* TODO ensure states linked-list is empty */
 	printk(KERN_DEBUG "ledcontroller: store attr 'led'\n");
 	if((ret = kstrtos16(buffer, 10, &pin_number)) != 0)
 		return ret;
+	if(pin_number < 0)
+		pin_number = -1;
+	if(pin_number == led->pin_number)
+	{
+		// nothing to do
+		return count;
+	}
 	// else, store it
 	down_write(&led->pin_number_sem);
+	prev = led->gpio;
+	// get new GPIO desc
+	if(pin_number >= 0)
+	{
+		// request legacy
+		if((ret = gpio_request((unsigned)pin_number, NULL)))
+		{
+			up_write(&led->pin_number_sem);
+			return ret;
+		}
+		// legacy -> new
+		led->gpio = gpio_to_desc((unsigned)pin_number);
+		if(!led->gpio)
+		{
+			// reset
+			led->gpio = prev;
+			up_write(&led->pin_number_sem);
+			gpio_free((unsigned)pin_number);
+			return -EINVAL;
+		}
+		// configure
+		if((ret = gpiod_direction_output(led->gpio, LED_INITIAL_STATE)))
+		{
+			led->gpio = prev;
+			up_write(&led->pin_number_sem);
+			gpio_free((unsigned)pin_number);
+			return ret;
+		}
+	}
+	else
+	{
+		led->gpio = NULL;
+	}
+	// release previous desc
+	if(prev)
+	{
+		// reset to 0, just in case
+		gpiod_set_value(prev, 0);
+		gpio_free((unsigned)led->pin_number);
+		prev = NULL;
+	}
+	// finally, update the pin number on the structure
 	led->pin_number = pin_number;
 	up_write(&led->pin_number_sem);
 	return count;
