@@ -11,6 +11,12 @@
 #include <linux/gpio/consumer.h>
 #include <linux/gpio.h>
 #include <linux/fcntl.h>
+// for hrtimer
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
+// for gpio outputs
+#include <linux/wait.h>
+#include <linux/kthread.h>
 
 #include "structs.h"
 
@@ -18,7 +24,7 @@ MODULE_AUTHOR("Tiago Teixeira");
 MODULE_LICENSE("Dual BSD/GPL");
 
 /*
-	Linked List, CharDev I/O
+	Global stuff
 */
 
 int lc_dev_major = 0;
@@ -26,6 +32,115 @@ int lc_dev_minor = 0;
 #define LC_MINOR_COUNT 1
 
 struct lc_states_dev lc_states_dev;
+
+/*
+	Timers and GPIO
+*/
+
+struct hrtimer states_hrtimer;
+
+// default/empty
+#define TSIGNAL_NOT 0
+// continue scheduling, timer finished
+#define TSIGNAL_CNT 1
+// cancel scheduling, cleanup, wait for new events
+#define TSIGNAL_CAN 2
+// cleanup and exit thread
+#define TSIGNAL_EXT 3
+static int timer_signal = 0;
+
+DECLARE_WAIT_QUEUE_HEAD(wq);
+
+static enum hrtimer_restart _states_hrtimer_callback(struct hrtimer *timer)
+{
+	printk(KERN_DEBUG "ledcontroller: signal in timer callback\n");
+	timer_signal = TSIGNAL_CNT;
+	wake_up(&wq);
+	return HRTIMER_NORESTART;
+}
+
+static int _thread_gpio_runner(void *data)
+{
+	struct lc_states_dev *dev = (struct lc_states_dev*)data;
+	int i;
+	// 1. infinite loop:
+	printk(KERN_DEBUG "ledcontroller-t: running thread\n");
+	while(1)
+	{
+		printk(KERN_DEBUG "ledcontroller-t: got signal: %d\n", timer_signal);
+		switch(timer_signal)
+		{
+			case TSIGNAL_NOT:	// first iteration
+			{
+				// do nothing
+				break;
+			}
+			case TSIGNAL_CNT:
+			{
+				down_read(&dev->semaphore);
+				// move cursor
+				if(!dev->cur||dev->cur==dev->tail)
+					// unititialized/end
+					dev->cur = dev->head;
+				else
+					dev->cur = dev->cur->next;
+				if(!dev->cur)
+				{
+					printk(KERN_WARNING "ledcontroller-t: timer IRQ on empty state list\n");
+					up_read(&dev->semaphore);
+					break;
+				}
+				// output gpio
+				down_read(&dev->leds->rw_semaphore);
+				for(i=0;i<dev->leds->led_count;i++)
+				{
+					if(dev->leds->leds[i]->gpio)
+					{
+						printk(KERN_DEBUG "ledcontroller-t: led %d value %d\n", i, dev->cur->led_values[i]);
+						gpiod_set_value(dev->leds->leds[i]->gpio, dev->cur->led_values[i]);
+					}
+					else
+						printk(KERN_WARNING "ledcontroller-t: GPIO output on unitialized LED\n");
+				}
+				up_read(&dev->leds->rw_semaphore);
+				// setup new timer
+				hrtimer_start(&states_hrtimer, ms_to_ktime(dev->cur->time * 1000), HRTIMER_MODE_REL);
+				up_read(&dev->semaphore);
+				break;
+			}
+			case TSIGNAL_CAN:
+			case TSIGNAL_EXT:
+			{
+				// clean out GPIO
+				down_read(&dev->leds->rw_semaphore);
+				for(i=0;i<dev->leds->led_count;i++)
+				{
+					if(dev->leds->leds[i]->gpio)
+						gpiod_set_value(dev->leds->leds[i]->gpio, 0);
+					else
+						printk(KERN_WARNING "ledcontroller: GPIO output on unitialized LED\n");
+				}
+				up_read(&dev->leds->rw_semaphore);
+				if(timer_signal==TSIGNAL_EXT)
+				{
+					printk(KERN_DEBUG "ledcontroller-t: exit on signal\n");
+					return 0;
+				}
+				break;
+			}
+		}
+		printk(KERN_DEBUG "ledcontroller-t: waiting for new event\n");
+		timer_signal = 0;
+		wait_event(wq, timer_signal);
+	}
+	printk(KERN_WARNING "ledcontroller-t: weird exit from thread function!\n");
+	return 0;
+}
+
+
+/*
+	Linked List, CharDev I/O
+*/
 
 static int lc_states_open(struct inode *inode, struct file *filp)
 {
@@ -35,7 +150,12 @@ static int lc_states_open(struct inode *inode, struct file *filp)
 		/* write without append, assume truncate: clean state */
 		struct lc_states_dev *dev = (struct lc_states_dev*)inode->i_cdev;
 		//struct leds *leds = dev->leds;
-		/* TODO: stop timers and clear LED outputs */
+		/* stop timers and clear LED outputs */
+		printk(KERN_DEBUG "ledcontroller: file open as TRUNC, cancelling timers\n");
+		hrtimer_cancel(&states_hrtimer);
+		timer_signal = TSIGNAL_CAN;
+		wake_up(&wq);
+		printk(KERN_DEBUG "ledcontroller: continuing `open`\n");
 		/* clear linked-lists */
 		down_write(&dev->semaphore);
 		/* `cur` is iterator, `head` is next*/
@@ -163,7 +283,24 @@ static ssize_t lc_states_write(struct file *filp, const char __user *buf, size_t
 	/* we ignore `fpos`, we only allow append */
 	ssize_t retval = -ENOMEM;
 	char *newline;
+	int all_set, i;
 	struct lc_states_dev *dev = (struct lc_states_dev*)filp->private_data;
+	/* don't allow writes if all pins are not set */
+	down_read(&dev->leds->rw_semaphore);
+	all_set = 1;
+	for(i=0;i<dev->leds->led_count;i++)
+	{
+		if(!dev->leds->leds[i]->gpio)
+			all_set = 0;
+	}
+	up_read(&dev->leds->rw_semaphore);
+	if(!all_set)
+	{
+		printk(KERN_WARNING "ledcontroller: attempt to write before all pins are set\n");
+		return -ENXIO;
+	}
+
+
 	if(mutex_lock_interruptible(&dev->partial_mx))
 		return -EINTR;
 
@@ -269,7 +406,7 @@ static ssize_t lc_states_write(struct file *filp, const char __user *buf, size_t
 			*newline = 0;
 			// parse
 			err = kstrtou32(it, 10, &node->time);
-			if(err == -ERANGE || err == -EINVAL)
+			if(err == -ERANGE || err == -EINVAL || node->time < 1)
 			{
 				// invalid
 				kfree(node->led_values);
@@ -298,7 +435,14 @@ static ssize_t lc_states_write(struct file *filp, const char __user *buf, size_t
 		if(_next_line(dev, newline, part_size))
 			return -ENOMEM;
 	}
-	up_write(&dev->semaphore);
+	downgrade_write(&dev->semaphore);
+	if(dev->head && !hrtimer_active(&states_hrtimer))
+	{
+		printk(KERN_DEBUG "ledcontroller: initializing timer\n");
+		timer_signal = TSIGNAL_CNT;
+		wake_up(&wq);
+	}
+	up_read(&dev->semaphore);
 	mutex_unlock(&dev->partial_mx);
 
 	return retval;
@@ -637,6 +781,8 @@ _fail_1:
 	Init/Exit functions
 */
 
+struct task_struct *gpio_thread;
+
 int lc_init_module(void)
 {
 	int ret, i;
@@ -680,8 +826,19 @@ int lc_init_module(void)
 			goto _fail_2;
 	}
 
+	hrtimer_init(&states_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	states_hrtimer.function = _states_hrtimer_callback;
+
+	if((gpio_thread = kthread_run(_thread_gpio_runner, &lc_states_dev, "ledc-gpio-runner")) == ERR_PTR(-ENOMEM))
+	{
+		ret = -ENOMEM;
+		goto _fail_3;
+	}
+
 	return 0;
 
+_fail_3:
+	hrtimer_cancel(&states_hrtimer);
 _fail_2:
 	unregister_chrdev_region(dev, LC_MINOR_COUNT);
 _fail_1:
@@ -705,6 +862,18 @@ void lc_exit_module(void)
 	dev_t devno;
 	struct lc_states_dev *dev = &lc_states_dev;	// minify
 
+	// stop timer
+	hrtimer_cancel(&states_hrtimer);
+	if(hrtimer_cancel(&states_hrtimer))
+	{
+		printk(KERN_WARNING "ledcontroller: timer was cancelled twice, may be an error\n");
+	}
+
+	printk(KERN_DEBUG "ledcontroller: signalling thread to exit\n");
+	timer_signal = TSIGNAL_EXT;
+	wake_up(&wq);
+	kthread_stop(gpio_thread);
+
 	/* free linked-list */
 	for(dev->cur=dev->head;dev->cur;dev->cur=dev->head)
 	{
@@ -714,8 +883,6 @@ void lc_exit_module(void)
 	}
 	if(dev->partial)
 		kfree(dev->partial);
-
-	cdev_del(&lc_states_dev.cdev);
 
 	devno = MKDEV(lc_dev_major, lc_dev_minor);
 	cdev_del(&lc_states_dev.cdev);
